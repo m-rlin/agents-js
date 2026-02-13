@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 import { type APIConnectOptions, type AudioBuffer, stt } from '@livekit/agents';
+import { Mutex } from '@livekit/mutex';
 import type { AudioFrame } from '@livekit/rtc-node';
 import WebSocket from 'ws';
 
@@ -179,6 +180,7 @@ export class RTZROpenAPIClient {
   private clientId: string;
   private clientSecret: string;
   private token: RTZRToken | null = null;
+  private tokenLock = new Mutex();
   private apiBase = 'https://openapi.vito.ai';
   private wsBase = 'wss://openapi.vito.ai';
 
@@ -192,14 +194,19 @@ export class RTZROpenAPIClient {
   }
 
   async getToken(): Promise<string> {
-    const now = Date.now() / 1000;
-    if (this.token === null || this.token.expire_at < now - 3600) {
-      await this.refreshToken();
+    const unlock = await this.tokenLock.lock();
+    try {
+      const now = Date.now() / 1000;
+      if (this.token === null || this.token.expire_at < now - 3600) {
+        await this.refreshToken();
+      }
+      if (this.token === null) {
+        throw new RTZRAPIError('Failed to obtain RTZR access token');
+      }
+      return this.token.access_token;
+    } finally {
+      unlock();
     }
-    if (this.token === null) {
-      throw new RTZRAPIError('Failed to obtain RTZR access token');
-    }
-    return this.token.access_token;
   }
 
   private async refreshToken(): Promise<void> {
@@ -402,6 +409,7 @@ export class SpeechStream extends stt.SpeechStream {
   private rtzrStt: STT;
   private ws: WebSocket | null = null;
   private state: StreamState = StreamState.IDLE;
+  private connectionLock = new Mutex();
   private lastAudioAt: number | null = null;
   private idleCheckInterval: ReturnType<typeof setInterval> | null = null;
   private audioBuffer: AudioByteStream;
@@ -494,69 +502,74 @@ export class SpeechStream extends stt.SpeechStream {
   }
 
   private async ensureConnected(): Promise<void> {
-    if (this.ws !== null) return;
+    const unlock = await this.connectionLock.lock();
+    try {
+      if (this.ws !== null) return;
 
-    const config = this.rtzrStt.client.buildConfig({
-      modelName: this.rtzrStt.options.model,
-      domain: this.rtzrStt.options.domain,
-      sampleRate: this.rtzrStt.options.sampleRate,
-      encoding: this.rtzrStt.options.encoding,
-      epdTime: this.rtzrStt.options.epdTime,
-      noiseThreshold: this.rtzrStt.options.noiseThreshold,
-      activeThreshold: this.rtzrStt.options.activeThreshold,
-      usePunctuation: this.rtzrStt.options.usePunctuation,
-      keywords: this.rtzrStt.options.keywords,
-    });
+      const config = this.rtzrStt.client.buildConfig({
+        modelName: this.rtzrStt.options.model,
+        domain: this.rtzrStt.options.domain,
+        sampleRate: this.rtzrStt.options.sampleRate,
+        encoding: this.rtzrStt.options.encoding,
+        epdTime: this.rtzrStt.options.epdTime,
+        noiseThreshold: this.rtzrStt.options.noiseThreshold,
+        activeThreshold: this.rtzrStt.options.activeThreshold,
+        usePunctuation: this.rtzrStt.options.usePunctuation,
+        keywords: this.rtzrStt.options.keywords,
+      });
 
-    const token = await this.rtzrStt.client.getToken();
-    const url = this.rtzrStt.client.getWebSocketUrl(config);
+      const token = await this.rtzrStt.client.getToken();
+      const url = this.rtzrStt.client.getWebSocketUrl(config);
 
-    return new Promise((resolve, reject) => {
-      try {
-        this.ws = new WebSocket(url, {
-          headers: {
-            Authorization: `bearer ${token}`,
-          },
-        });
+      await new Promise<void>((resolve, reject) => {
+        try {
+          this.ws = new WebSocket(url, {
+            headers: {
+              Authorization: `bearer ${token}`,
+            },
+          });
 
-        this.ws.binaryType = 'arraybuffer';
+          this.ws.binaryType = 'arraybuffer';
 
-        this.ws.on('open', () => {
-          console.log(
-            `[RTZR] WebSocket connected (model=${this.rtzrStt.options.model}, sr=${this.rtzrStt.options.sampleRate})`,
-          );
-          this.state = StreamState.ACTIVE;
-          this.lastAudioAt = Date.now();
-          resolve();
-        });
+          this.ws.on('open', () => {
+            console.log(
+              `[RTZR] WebSocket connected (model=${this.rtzrStt.options.model}, sr=${this.rtzrStt.options.sampleRate})`,
+            );
+            this.state = StreamState.ACTIVE;
+            this.lastAudioAt = Date.now();
+            resolve();
+          });
 
-        this.ws.on('message', (data: WebSocket.Data) => {
-          this.handleMessage(data);
-        });
+          this.ws.on('message', (data: WebSocket.Data) => {
+            this.handleMessage(data);
+          });
 
-        this.ws.on('error', (error: Error) => {
-          console.error('[RTZR] WebSocket error:', error);
-          if (this.state === StreamState.IDLE) {
-            reject(new RTZRConnectionError('WebSocket connection failed'));
-          }
-        });
+          this.ws.on('error', (error: Error) => {
+            console.error('[RTZR] WebSocket error:', error);
+            if (this.state === StreamState.IDLE) {
+              reject(new RTZRConnectionError('WebSocket connection failed'));
+            }
+          });
 
-        this.ws.on('close', () => {
-          console.log('[RTZR] WebSocket closed');
-          if (this.resolveClose) {
-            this.resolveClose();
-            this.resolveClose = null;
-          }
-          this.ws = null;
-          if (this.state !== StreamState.CLOSED) {
-            this.state = StreamState.IDLE;
-          }
-        });
-      } catch (error) {
-        this.state = StreamState.IDLE;
-        reject(error);
-      }
-    });
+          this.ws.on('close', () => {
+            console.log('[RTZR] WebSocket closed');
+            if (this.resolveClose) {
+              this.resolveClose();
+              this.resolveClose = null;
+            }
+            this.ws = null;
+            if (this.state !== StreamState.CLOSED) {
+              this.state = StreamState.IDLE;
+            }
+          });
+        } catch (error) {
+          this.state = StreamState.IDLE;
+          reject(error);
+        }
+      });
+    } finally {
+      unlock();
+    }
   }
 
   private handleMessage(rawData: WebSocket.Data): void {
@@ -666,20 +679,25 @@ export class SpeechStream extends stt.SpeechStream {
   }
 
   private async endSegment(): Promise<void> {
-    if (!this.ws) return;
-
-    this.state = StreamState.CLOSING;
+    const unlock = await this.connectionLock.lock();
     try {
-      this.ws.send('EOS');
-      console.log('[RTZR] Sent EOS to close audio segment');
-    } catch (error) {
-      console.error('[RTZR] Failed to send EOS:', error);
-    }
+      if (!this.ws) return;
 
-    await this.awaitRecvCompletion();
-    await this.cleanupConnection();
-    this.state = StreamState.IDLE;
-    this.lastAudioAt = null;
+      this.state = StreamState.CLOSING;
+      try {
+        this.ws.send('EOS');
+        console.log('[RTZR] Sent EOS to close audio segment');
+      } catch (error) {
+        console.error('[RTZR] Failed to send EOS:', error);
+      }
+
+      await this.awaitRecvCompletion();
+      await this.cleanupConnection();
+      this.state = StreamState.IDLE;
+      this.lastAudioAt = null;
+    } finally {
+      unlock();
+    }
   }
 
   private startIdleWatchdog(): void {

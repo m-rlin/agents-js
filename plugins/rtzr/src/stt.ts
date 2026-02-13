@@ -184,9 +184,21 @@ export class RTZROpenAPIClient {
   private apiBase = 'https://openapi.vito.ai';
   private wsBase = 'wss://openapi.vito.ai';
 
-  constructor(clientId?: string, clientSecret?: string) {
-    this.clientId = clientId || process.env.RTZR_CLIENT_ID || '';
-    this.clientSecret = clientSecret || process.env.RTZR_CLIENT_SECRET || '';
+  constructor(options?: {
+    clientId?: string;
+    clientSecret?: string;
+    apiBase?: string;
+    wsBase?: string;
+  }) {
+    this.clientId = options?.clientId || process.env.RTZR_CLIENT_ID || '';
+    this.clientSecret = options?.clientSecret || process.env.RTZR_CLIENT_SECRET || '';
+
+    if (options?.apiBase) {
+      this.apiBase = options.apiBase;
+    }
+    if (options?.wsBase) {
+      this.wsBase = options.wsBase;
+    }
 
     if (!this.clientId || !this.clientSecret) {
       throw new Error('RTZR_CLIENT_ID and RTZR_CLIENT_SECRET must be set');
@@ -337,6 +349,8 @@ export interface STTOptions {
   activeThreshold?: number;
   usePunctuation?: boolean;
   keywords?: Keyword[] | null;
+  apiBase?: string;
+  wsBase?: string;
 }
 export type RTZRSTTOptions = STTOptions;
 
@@ -369,7 +383,10 @@ export class STT extends stt.STT {
       console.warn('[RTZR] Keyword boosting is only supported with sommers_ko model');
     }
 
-    this._client = new RTZROpenAPIClient();
+    this._client = new RTZROpenAPIClient({
+      apiBase: options.apiBase,
+      wsBase: options.wsBase,
+    });
     console.log(
       `[RTZR] STT initialized: model=${this.params.model}, sampleRate=${this.params.sampleRate}, language=${this.params.language}`,
     );
